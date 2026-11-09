@@ -3,15 +3,18 @@
 
 import argparse
 import hashlib
+import gzip
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
+from email.utils import format_datetime
 
 
 def run(args, **kwargs):
@@ -146,7 +149,72 @@ def smoke(binary, runtime=None):
         run([binary, '--clean', '--headless', '-i', 'NONE', '-c', 'lua ' + lua, '-c', 'qa!'], env=env)
 
 
+def compress(path):
+    """Use reproducible gzip headers for Debian documentation and manual pages."""
+    target = path.with_name(path.name + '.gz')
+    with path.open('rb') as source, target.open('wb') as destination:
+        with gzip.GzipFile(filename='', mode='wb', fileobj=destination, mtime=0, compresslevel=9) as archive:
+            shutil.copyfileobj(source, archive)
+    path.unlink()
+
+
+def prepare_payload(payload, info, name, version, maintainer, strip):
+    source = Path(info['source']['path'])
+    documentation = payload / 'usr/share/doc' / name
+    documentation.mkdir(parents=True, exist_ok=True)
+    license_file = source / 'LICENSE.txt'
+    shutil.copyfile(license_file, documentation / 'upstream-license.txt')
+    copyright_notice = license_file.read_text(encoding='utf-8').splitlines()[0]
+    (documentation / 'copyright').write_text(
+        copyright_notice + '\n\n'
+        'Upstream source: https://github.com/neovim/neovim\n\n'
+        'The complete upstream copyright and licensing notices, including the\n'
+        'Vim license and component-specific terms, are preserved verbatim in\n'
+        f'/usr/share/doc/{name}/upstream-license.txt. Additional bundled-library\n'
+        f'and parser notices are in /usr/share/doc/{name}/licenses/.\n\n'
+        'On Debian systems, standard license texts are also available at:\n'
+        '  /usr/share/common-licenses/Apache-2.0\n'
+        '  /usr/share/common-licenses/LGPL-2\n'
+        '  /usr/share/common-licenses/LGPL-2.1\n'
+        '  /usr/share/common-licenses/LGPL-3\n'
+        '  /usr/share/common-licenses/GPL-2\n', encoding='utf-8')
+    # Keep the exact upstream notices for bundled libraries and parser grammars.
+    deps = info['dependencies']['configuration'].get('CMAKE_CACHEFILE_DIR')
+    if deps:
+        for dependency in sorted((Path(deps) / 'build/src').glob('*')):
+            if not dependency.is_dir() or dependency.name.endswith(('-build', '-stamp')):
+                continue
+            for notice in sorted(dependency.iterdir()):
+                if notice.is_file() and notice.name.upper().split('.')[0] in ('LICENSE', 'COPYING', 'COPYRIGHT', 'NOTICE'):
+                    destination = documentation / 'licenses' / dependency.name / notice.name
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(notice, destination)
+    date = format_datetime(datetime.fromisoformat(info['built_at_utc']))
+    changelog = documentation / 'changelog'
+    changelog.write_text(
+        f'{name} ({version}) unstable; urgency=medium\n\n'
+        f'  * Local build of upstream Neovim {info["source"]["commit"]}.\n'
+        '  * Package the optimized executable, bundled parsers and runtime.\n\n'
+        f' -- {maintainer}  {date}\n', encoding='utf-8')
+    compress(changelog)
+    for path in sorted((payload / 'usr/share/man').rglob('*')):
+        if path.is_file() and not path.is_symlink() and path.suffix != '.gz':
+            compress(path)
+    # CMake's --strip misses parsers installed as files rather than targets.
+    for path in sorted(payload.rglob('*')):
+        if path.is_file() and not path.is_symlink():
+            with path.open('rb') as stream:
+                elf = stream.read(4) == b'\x7fELF'
+            if elf:
+                run([strip, '--strip-unneeded', path])
+    remote_ssh = payload / 'usr/share/nvim/runtime/scripts/remote_ssh.sh'
+    if remote_ssh.exists():
+        remote_ssh.chmod(remote_ssh.stat().st_mode | 0o111)
+
+
 def package(args):
+    if not re.fullmatch(r'[^<>\r\n]+ <[^<>\s@]+@[^<>\s@]+>', args.maintainer):
+        raise ValueError('PACKAGE_MAINTAINER must be Name <email>; set it explicitly or configure Git user.name/user.email')
     build, destination = Path(args.build).resolve(), Path(args.output).resolve()
     metadata = build / 'build-info.json'
     if not metadata.exists():
@@ -168,13 +236,24 @@ def package(args):
         # preinstall build by packaging this explicitly staged filesystem instead.
         run([args.cmake, '--install', build, '--prefix', '/usr', '--strip'],
             env=dict(os.environ, DESTDIR=str(payload)))
+        prepare_payload(payload, info, args.name, version, args.maintainer,
+                        cache_values(build).get('CMAKE_STRIP', 'strip'))
+        description = ('Neovim is a text editor based on Vim with Lua scripting, an RPC API,\n'
+                       'asynchronous jobs, and Tree-sitter syntax parsing.\n'
+                       'This package contains a local build and its runtime files.')
         run([args.cpack, '--config', build / 'CPackConfig.cmake', '-G', 'DEB',
              '-B', staging, '-D', 'CPACK_PACKAGE_FILE_NAME=neovim-local',
              '-D', 'CPACK_INSTALL_CMAKE_PROJECTS=',
              '-D', f'CPACK_INSTALLED_DIRECTORIES={payload};/',
              '-D', 'CPACK_PACKAGING_INSTALL_PREFIX=/',
              '-D', f'CPACK_DEBIAN_PACKAGE_NAME={args.name}',
-             '-D', f'CPACK_DEBIAN_PACKAGE_VERSION={version}', '-D', 'CPACK_STRIP_FILES=ON'])
+             '-D', f'CPACK_DEBIAN_PACKAGE_VERSION={version}',
+             '-D', f'CPACK_DEBIAN_PACKAGE_MAINTAINER={args.maintainer}',
+             '-D', 'CPACK_DEBIAN_PACKAGE_SECTION=editors',
+             '-D', 'CPACK_DEBIAN_PACKAGE_HOMEPAGE=https://neovim.io/',
+             '-D', 'CPACK_PACKAGE_DESCRIPTION_SUMMARY=extensible text editor',
+             '-D', f'CPACK_DEBIAN_PACKAGE_DESCRIPTION={description}',
+             '-D', 'CPACK_STRIP_FILES=ON'])
         deb = staging / 'neovim-local.deb'
         for field, expected in (('Package', args.name), ('Version', version)):
             actual = output(['dpkg-deb', '-f', deb, field])
@@ -192,9 +271,10 @@ def package(args):
         report.write_text(lint.stdout)
         print(lint.stdout, end='', flush=True)
         if lint.returncode:
+            shutil.copyfile(report, destination / 'neovim-local.failed.lintian.txt')
             raise ValueError(f'lintian failed with exit status {lint.returncode}; package was not published')
         info['package'] = {
-            'name': args.name, 'version': version, 'sha256': digest(deb),
+            'name': args.name, 'version': version, 'maintainer': args.maintainer, 'sha256': digest(deb),
             'architecture': output(['dpkg-deb', '-f', deb, 'Architecture']),
             'depends': output(['dpkg-deb', '-f', deb, 'Depends']),
             'lintian_version': output([args.lintian, '--version']),
@@ -229,7 +309,7 @@ def main():
     cmd.add_argument('--binary', required=True)
     cmd.set_defaults(action=lambda args: smoke(args.binary))
     cmd = commands.add_parser('package')
-    for name in ('build', 'output', 'name', 'cmake', 'cpack', 'lintian'):
+    for name in ('build', 'output', 'name', 'maintainer', 'cmake', 'cpack', 'lintian'):
         cmd.add_argument('--' + name, required=True)
     cmd.add_argument('--version', default='')
     cmd.set_defaults(action=package)

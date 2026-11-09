@@ -26,6 +26,7 @@ NATIVE ?= $(if $(filter native,$(PROFILE)),ON,OFF)
 USE_MOLD ?= $(if $(shell command -v mold 2>/dev/null),ON,OFF)
 ENABLE_LTO ?= $(if $(filter debug,$(PROFILE)),OFF,ON)
 PACKAGE_NAME ?= neovim
+PACKAGE_MAINTAINER ?= $(shell git config user.name) <$(shell git config user.email)>
 BUILD_TYPE := $(if $(filter debug,$(PROFILE)),RelWithDebInfo,Release)
 
 # Upstream controls dependency optimization and Release's -O3/NDEBUG flags.
@@ -88,7 +89,7 @@ verify:
 
 package: check-package-tools
 	$(PYTHON) "$(SUPPORT)" package --build "$(BUILD_DIR)" --output "$(PACKAGE_DIR)" \
-		--name "$(PACKAGE_NAME)" --version "$(PACKAGE_VERSION)" --cmake "$(CMAKE)" --cpack "$(CPACK)" --lintian "$(LINTIAN)"
+		--name "$(PACKAGE_NAME)" --maintainer "$(PACKAGE_MAINTAINER)" --version "$(PACKAGE_VERSION)" --cmake "$(CMAKE)" --cpack "$(CPACK)" --lintian "$(LINTIAN)"
 
 install: package
 	$(SUDO) apt-get install "$(DEB_PACKAGE)"

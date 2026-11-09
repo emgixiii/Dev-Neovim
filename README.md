@@ -13,7 +13,12 @@ upstream Neovim build prerequisites. Packaging additionally requires CPack,
 `lintian`. Mold is automatically used when available; `USE_MOLD=OFF` disables it.
 Lintian is required and errors prevent publication and installation. Upstream
 packaging can produce lintian findings; the complete report is printed so these
-can be corrected rather than silently ignored.
+can be corrected rather than silently ignored. `PACKAGE_MAINTAINER` defaults to
+Git's configured `user.name <user.email>` and can be overridden explicitly:
+
+```sh
+make package PACKAGE_MAINTAINER='Your Name <you@example.com>'
+```
 
 ## Install the native optimized build
 
@@ -77,7 +82,10 @@ purges it even if the installed copy came from the distribution.
 ## Package validation and artifacts
 
 Packaging installs the build into a temporary filesystem using `cmake --install`
-and packages that tree, avoiding CPack's implicit preinstall compilation. It then:
+and prepares its Debian metadata and payload: it adds copyright/license notices
+and a compressed changelog, compresses manual pages, and strips every staged ELF
+file, including bundled parser libraries. The original build files stay intact.
+It packages that tree, avoiding CPack's implicit preinstall compilation, then:
 
 1. Checks the Debian package name and version.
 2. Extracts the package and runs its executable with its extracted runtime.
@@ -96,7 +104,8 @@ Artifacts live in `build/packages/PROFILE/`:
 - `neovim-local.sha256`: hashes of all three files above.
 
 The build binary remains unstripped. Failed validation preserves previously
-published artifacts. Check companion-file integrity from their directory:
+published artifacts and saves the failed lintian report separately as
+`neovim-local.failed.lintian.txt`. Check companion-file integrity from their directory:
 
 ```sh
 cd build/packages/native
@@ -139,5 +148,7 @@ The tests use temporary repositories and fake compiler/build/privilege commands,
 with real Debian archive creation and extraction. They cover profile selection,
 standalone stages, metadata/checksums, extracted-runtime checks, failure handling,
 source/configuration changes, cache retention/migration, and install ordering.
-They do not install or remove system packages. Python 3, Git, Make, `gcc`, and
+When lintian and binutils are available, an additional regression check builds a
+small real executable and parser library, prepares their Debian payload, and runs
+real lintian. They do not install or remove system packages. Python 3, Git, Make, `gcc`, and
 `dpkg-deb` are required to run the full suite.

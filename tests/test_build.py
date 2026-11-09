@@ -1,5 +1,6 @@
 """Workflow tests use fake build tools and real dpkg archives; never use sudo."""
 import importlib.util
+import gzip
 import json
 import os
 from pathlib import Path
@@ -73,6 +74,7 @@ class WorkflowTests(unittest.TestCase):
         self.source = self.root / 'source'
         (self.source / 'cmake.deps').mkdir(parents=True)
         (self.source / 'CMakeLists.txt').write_text('set(NVIM_VERSION_MAJOR 1)\nset(NVIM_VERSION_MINOR 2)\nset(NVIM_VERSION_PATCH 3)\nset(NVIM_VERSION_PRERELEASE "-dev")\n')
+        (self.source / 'LICENSE.txt').write_text('Copyright fixture contributors. MIT license.\n')
         (self.source / 'cmake.deps/deps.txt').write_text('LIBUV_URL https://example.com/libuv-1.0.tar.gz\nLIBUV_SHA256 abc\n')
         subprocess.run(['git', 'init', '-q', self.source], check=True)
         subprocess.run(['git', '-C', self.source, 'add', '.'], check=True)
@@ -96,7 +98,7 @@ class WorkflowTests(unittest.TestCase):
             env['FAIL_TOOL'] = fail
         result = subprocess.run(['make', '--no-print-directory', *targets,
                                  f'BUILD_ROOT={self.build}', f'NEOVIM_DIR={self.source}',
-                                 'USE_MOLD=OFF', 'JOBS=2', 'PACKAGE_VERSION=1.2.3'],
+                                 'USE_MOLD=OFF', 'JOBS=2', 'PACKAGE_VERSION=1.2.3', 'PACKAGE_MAINTAINER=Tester <test@example.com>'],
                                 cwd=ROOT, env=env, text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
         self.assertEqual(result.returncode == 0, success, result.stdout)
@@ -191,6 +193,68 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(names[-1], 'sudo')
         self.assertLess(names.index('cmake'), names.index('cpack'))
         self.assertLess(names.index('lintian'), names.index('sudo'))
+
+
+@unittest.skipUnless(all(shutil.which(tool) for tool in ('gcc', 'strip', 'dpkg-deb', 'lintian', 'readelf')),
+                     'requires gcc, binutils, dpkg-deb and real lintian')
+class DebianPayloadTests(unittest.TestCase):
+    def test_documentation_and_all_elf_files_pass_real_lintian(self):
+        with tempfile.TemporaryDirectory(prefix='neovim-debian-payload-') as directory:
+            root = Path(directory)
+            source, payload = root / 'source', root / 'payload'
+            source.mkdir()
+            (source / 'LICENSE.txt').write_text('Copyright 2026 Test contributors. All rights reserved.\n')
+            binary, parser = payload / 'usr/bin/nvim', payload / 'usr/lib/neovim/parser/fixture.so'
+            binary.parent.mkdir(parents=True)
+            parser.parent.mkdir(parents=True)
+            program = root / 'program.c'
+            program.write_text('int main(void) { return 0; }\n')
+            subprocess.run(['gcc', '-g', program, '-o', binary], check=True)
+            unstripped = root / 'parser.so'
+            subprocess.run(['gcc', '-g', '-shared', '-fPIC', program, '-o', unstripped], check=True)
+            original_hash = support.digest(unstripped)
+            shutil.copyfile(unstripped, parser)
+            man = payload / 'usr/share/man/man1/nvim.1'
+            man.parent.mkdir(parents=True)
+            man.write_text('.TH NVIM 1 "2026-11-09"\n.SH NAME\nnvim \\- extensible text editor\n')
+            remote = payload / 'usr/share/nvim/runtime/scripts/remote_ssh.sh'
+            remote.parent.mkdir(parents=True)
+            remote.write_text('#!/bin/sh\nexit 0\n')
+            deps = root / 'deps'
+            notice = deps / 'build/src/parser/LICENSE'
+            notice.parent.mkdir(parents=True)
+            notice.write_text('Copyright parser contributors.\n')
+            info = {
+                'source': {'path': str(source), 'commit': 'a' * 40},
+                'built_at_utc': '2026-11-09T12:00:00+00:00',
+                'dependencies': {'configuration': {'CMAKE_CACHEFILE_DIR': str(deps)}},
+            }
+            support.prepare_payload(payload, info, 'neovim', '1.2.3', 'Tester <test@example.com>', 'strip')
+            self.assertFalse(man.exists())
+            self.assertIn('extensible text editor', gzip.decompress(man.with_suffix('.1.gz').read_bytes()).decode())
+            docs = payload / 'usr/share/doc/neovim'
+            self.assertEqual((docs / 'upstream-license.txt').read_bytes(), (source / 'LICENSE.txt').read_bytes())
+            self.assertIn('/usr/share/common-licenses/Apache-2.0', (docs / 'copyright').read_text())
+            self.assertIn('neovim (1.2.3)', gzip.decompress((docs / 'changelog.gz').read_bytes()).decode())
+            self.assertEqual((docs / 'licenses/parser/LICENSE').read_bytes(), notice.read_bytes())
+            self.assertTrue(os.access(remote, os.X_OK))
+            self.assertEqual(support.digest(unstripped), original_hash)
+            for elf in (binary, parser):
+                sections = subprocess.check_output(['readelf', '-S', elf], text=True)
+                self.assertNotIn('.debug_info', sections)
+                self.assertNotIn('.symtab', sections)
+            control = payload / 'DEBIAN/control'
+            control.parent.mkdir()
+            control.write_text('Package: neovim\nVersion: 1.2.3\nArchitecture: amd64\n'
+                               'Maintainer: Tester <test@example.com>\nSection: editors\n'
+                               'Priority: optional\nDepends: libc6\n'
+                               'Description: extensible text editor\n'
+                               ' Local text editor package for testing Debian payload preparation.\n')
+            deb = root / 'neovim.deb'
+            subprocess.run(['dpkg-deb', '--build', '--root-owner-group', payload, deb], check=True,
+                           stdout=subprocess.DEVNULL)
+            lint = subprocess.run(['lintian', deb], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual(lint.returncode, 0, lint.stdout)
 
 
 class CacheMigrationTests(unittest.TestCase):
